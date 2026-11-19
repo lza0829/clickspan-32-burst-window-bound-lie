@@ -1,0 +1,14 @@
+{
+  "batch_id": "B-burst-001",
+  "hits": [
+    {"id": "D1", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:00:00Z", "page_path": "/promo", "event_name": "click", "visitor_label": "访客丁"},
+    {"id": "D2", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:00:01Z", "page_path": "/promo", "event_name": "click"},
+    {"id": "D3", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:00:02Z", "page_path": "/promo", "event_name": "click"},
+    {"id": "D4", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:00:05Z", "page_path": "/promo", "event_name": "click"},
+    {"id": "D5", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:02:00Z", "page_path": "/promo", "event_name": "click"},
+    {"id": "D6", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:02:10Z", "page_path": "/promo", "event_name": "click"},
+    {"id": "D7", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:00:03Z", "page_path": "/promo", "event_name": "view"},
+    {"id": "D8", "visitor_id": "V-2001", "event_ts": "2026-11-17T11:00:04Z", "page_path": "/promo", "event_name": "view"},
+    {"id": "D9", "visitor_id": "V-2002", "event_ts": "2026-11-17T11:00:01Z", "page_path": "/promo", "event_name": "click", "visitor_label": "访客戊"}
+  ]
+}
