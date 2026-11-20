@@ -47,6 +47,7 @@ def db():
     conn.execute("DELETE FROM sessions")
     conn.execute("DELETE FROM visitors")
     conn.execute("DELETE FROM ingest_batches")
+    conn.execute("DELETE FROM burst_dedupe_proofs")
     conn.execute("DELETE FROM settings")
     conn.commit()
     conn.close()
@@ -385,3 +386,236 @@ def test_fixture_file_end_to_end(db):
     ][0]
     assert [h["id"] for h in group["formal"]] == ["H9", "H13"]
     assert [h["hit_id"] for h in group["held"]] == ["H10", "H11", "H12"]
+
+
+# ---------------------------------------------------------------------------
+# 窗界证明核证（新增基线所无的只读接口）
+# ---------------------------------------------------------------------------
+
+
+def test_window_proof_covers_all_skipped_keys(db):
+    """夹具窗内连打：核「键∈窗界且证明含齐」。"""
+    res = ingest_svc.run_batch(FIXTURE)
+    assert res["ok"], res
+    report = res["report"]
+    assert report["skipped_keys"], "去重成功须有 skipped 快照"
+
+    conn = connect()
+    try:
+        proof = burst.window_proof(conn, batch_id=report["batch_id"])
+    finally:
+        conn.close()
+
+    assert proof["ok"], proof["anomalies"]
+    assert proof["read_only"] is True
+    assert proof["summary"]["proofs"] == 1
+    entry = proof["proofs"][0]
+
+    # 证明键集合 = 本批实际跳过集合。
+    assert sorted(entry["skipped_keys"]) == sorted(report["skipped_keys"])
+    assert set(entry["skipped_keys"]) == {"B2", "B3"}
+
+    # 每个跳过键的时刻落在证明窗界内（两端闭）。
+    start = burst.parse_ts(entry["window_start"])
+    end = burst.parse_ts(entry["window_end"])
+    for skipped in entry["skipped"]:
+        ts = burst.parse_ts(skipped["event_ts"])
+        assert start <= ts <= end, skipped
+    assert start == burst.parse_ts("2026-11-17T09:00:01Z")
+    assert end == burst.parse_ts("2026-11-17T09:00:30Z")
+
+
+def test_window_proof_survives_config_change(db):
+    """改窗配置后旧证明窗界不变（不可回溯改写）。"""
+    res = ingest_svc.run_batch(FIXTURE)
+    assert res["ok"], res
+    batch_id = res["report"]["batch_id"]
+
+    conn = connect()
+    try:
+        before = burst.window_proof(conn, batch_id=batch_id)
+        burst.set_burst_window_sec(conn, 5)
+        conn.commit()
+        after = burst.window_proof(conn, batch_id=batch_id)
+    finally:
+        conn.close()
+
+    a = before["proofs"][0]
+    b = after["proofs"][0]
+    assert (a["window_start"], a["window_end"], a["window_sec"]) == (
+        b["window_start"], b["window_end"], b["window_sec"]
+    )
+    assert a["skipped_keys"] == b["skipped_keys"]
+    # 当前窗已变，但旧证明的窗秒快照仍是入正式时的值。
+    assert after["current_window_sec"] == 5
+    assert b["window_sec"] == 60
+    assert after["ok"], after["anomalies"]
+
+
+def test_window_proof_row_is_immutable(db):
+    """落库后的窗界证明不可 UPDATE（改窗不得回溯改写旧窗界）。"""
+    res = ingest_svc.run_batch(FIXTURE)
+    assert res["ok"], res
+    batch_id = res["report"]["batch_id"]
+
+    conn = connect()
+    try:
+        before = conn.execute(
+            "SELECT window_start, window_end FROM burst_dedupe_proofs WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        with pytest.raises(Exception):
+            conn.execute(
+                "UPDATE burst_dedupe_proofs SET window_start='1970-01-01T00:00:00Z'"
+                " WHERE batch_id=?",
+                (batch_id,),
+            )
+        conn.rollback()
+        after = conn.execute(
+            "SELECT window_start, window_end FROM burst_dedupe_proofs WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert dict(before) == dict(after)
+
+
+def test_window_proof_detects_key_outside_bounds(db):
+    """证明窗界覆盖不到某个 skipped 键时须报异常。"""
+    res = ingest_svc.run_batch(FIXTURE)
+    assert res["ok"], res
+    batch_id = res["report"]["batch_id"]
+
+    conn = connect()
+    try:
+        # 绕过触发器临时改写：先删触发器再收窄窗界，模拟坏证明。
+        conn.execute("DROP TRIGGER burst_dedupe_proofs_immutable")
+        conn.execute(
+            "UPDATE burst_dedupe_proofs SET window_end='2026-11-17T09:00:05Z'"
+            " WHERE batch_id=?",
+            (batch_id,),
+        )
+        conn.commit()
+        proof = burst.window_proof(conn, batch_id=batch_id)
+    finally:
+        conn.close()
+
+    assert proof["ok"] is False
+    codes = {a["code"] for a in proof["anomalies"]}
+    assert "skipped_key_outside_window" in codes
+
+
+def test_window_proof_detects_missing_skipped_key(db):
+    """证明缺跳过键时须报异常。"""
+    res = ingest_svc.run_batch(FIXTURE)
+    assert res["ok"], res
+    batch_id = res["report"]["batch_id"]
+
+    conn = connect()
+    try:
+        conn.execute("DROP TRIGGER burst_dedupe_proofs_immutable")
+        row = conn.execute(
+            "SELECT skipped_keys_json FROM burst_dedupe_proofs WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        keys = json.loads(row["skipped_keys_json"])
+        keys = [k for k in keys if k["hit_id"] != "B3"]
+        conn.execute(
+            "UPDATE burst_dedupe_proofs SET skipped_keys_json=?, skipped_count=?"
+            " WHERE batch_id=?",
+            (json.dumps(keys, ensure_ascii=False, sort_keys=True), len(keys), batch_id),
+        )
+        conn.commit()
+        proof = burst.window_proof(conn, batch_id=batch_id)
+    finally:
+        conn.close()
+
+    assert proof["ok"] is False
+    codes = {a["code"] for a in proof["anomalies"]}
+    assert "proof_missing_skipped_key" in codes
+
+
+def test_window_proof_unverifiable_skip_rolls_back_batch(db):
+    """跳过键时刻不可核证时整批回滚，绝不落覆盖不全的证明。"""
+    conn = connect()
+    try:
+        with pytest.raises(ValueError):
+            burst.record_window_proof(
+                conn,
+                proof_run_id="P-bad",
+                batch_id="B-bad",
+                window_sec=60,
+                skipped=[
+                    {"hit_id": "X1", "visitor_id": "V-1", "page_path": "/x",
+                     "event_name": "click", "event_ts": "not-a-time"},
+                ],
+                created_at="2026-11-17T00:00:00Z",
+            )
+        conn.rollback()
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM burst_dedupe_proofs WHERE batch_id='B-bad'"
+        ).fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+def test_window_proof_api_read_only(db):
+    client = TestClient(app)
+    with client:
+        run = client.post("/api/ingest/run", json=FIXTURE).json()
+        assert run["ok"]
+
+        before = _rows("SELECT COUNT(*) AS c FROM burst_dedupe_proofs")[0]["c"]
+        proof = client.get(
+            "/api/burst-dedupe/window-proof",
+            params={"batch_id": run["report"]["batch_id"]},
+        ).json()
+        after = _rows("SELECT COUNT(*) AS c FROM burst_dedupe_proofs")[0]["c"]
+
+        assert before == after
+        assert proof["read_only"] is True
+        assert proof["ok"] is True
+        assert proof["proofs"][0]["skipped_keys"] == ["B2", "B3"]
+
+        # 全量查询亦无异常。
+        whole = client.get("/api/burst-dedupe/window-proof").json()
+        assert whole["ok"], whole["anomalies"]
+
+
+def test_window_proof_detects_orphan_skips(db):
+    """有实际跳过却无证明行时须报异常。"""
+    res = ingest_svc.run_batch(FIXTURE)
+    assert res["ok"], res
+    conn = connect()
+    try:
+        conn.execute("DELETE FROM burst_dedupe_proofs")
+        conn.commit()
+        proof = burst.window_proof(conn)
+    finally:
+        conn.close()
+    assert proof["ok"] is False
+    codes = {a["code"] for a in proof["anomalies"]}
+    assert "window_proof_missing" in codes
+
+
+def test_window_proof_visitor_filter_still_ok(db):
+    """按访客过滤时，本访客跳过键仍须被证明覆盖，结论仍通过。"""
+    res = ingest_svc.run_batch(FIXTURE)
+    assert res["ok"], res
+    conn = connect()
+    try:
+        proof = burst.window_proof(conn, visitor_id="V-1")
+    finally:
+        conn.close()
+    assert proof["visitor_filtered"] is True
+    assert proof["ok"], proof["anomalies"]
+    assert proof["proofs"][0]["skipped_keys"] == ["B2", "B3"]
+
+    # 另一访客在本批无跳过键：不产出该证明、亦不误报。
+    conn = connect()
+    try:
+        other = burst.window_proof(conn, visitor_id="V-2")
+    finally:
+        conn.close()
+    assert other["ok"], other["anomalies"]
+    assert other["summary"]["proofs"] == 0

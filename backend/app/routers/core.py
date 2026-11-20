@@ -160,6 +160,25 @@ def burst_dedupe_proof(visitor_id: str | None = None):
         conn.close()
 
 
+@router.get("/burst-dedupe/window-proof")
+def burst_dedupe_window_proof(
+    batch_id: str | None = None, visitor_id: str | None = None
+):
+    """窗界核证（只读，基线所无）：窗界 / skipped 集合 / 结论。
+
+    - 去重成功时窗界必须覆盖全部 ``skipped_keys``；
+    - 证明键集合 = 实际跳过集合；
+    - 旧证明窗界不可被新配置回溯改写。
+
+    本接口不写库；可传 ``?batch_id=`` / ``?visitor_id=`` 过滤。
+    """
+    conn = connect()
+    try:
+        return burst.window_proof(conn, batch_id=batch_id, visitor_id=visitor_id)
+    finally:
+        conn.close()
+
+
 @router.get("/burst-dedupe/config")
 def burst_dedupe_config():
     conn = connect()

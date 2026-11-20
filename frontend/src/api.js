@@ -29,4 +29,11 @@ export const api = {
         ? `/api/burst-dedupe/proof?visitor_id=${encodeURIComponent(visitorId)}`
         : '/api/burst-dedupe/proof',
     ),
+  burstWindowProof: (batchId, visitorId) => {
+    const q = new URLSearchParams()
+    if (batchId) q.set('batch_id', batchId)
+    if (visitorId) q.set('visitor_id', visitorId)
+    const qs = q.toString()
+    return req(`/api/burst-dedupe/window-proof${qs ? `?${qs}` : ''}`)
+  },
 }

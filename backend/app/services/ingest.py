@@ -29,8 +29,11 @@ def run_batch(payload: dict | None = None) -> dict:
     try:
         conn.execute("BEGIN IMMEDIATE")
         window_sec = burst.burst_window_sec(conn)
+        # 本次去重的窗界证明标识；与跳过写入同一事务落库，缺一回滚。
+        proof_run_id = f"P-{batch_id}-{uuid.uuid4().hex[:8]}"
         report = {
             "batch_id": batch_id,
+            "proof_run_id": proof_run_id,
             "written": 0,
             "held": 0,
             "skipped": 0,
@@ -40,19 +43,37 @@ def run_batch(payload: dict | None = None) -> dict:
             "approach": burst.APPROACH,
             "held_hit_ids": [],
         }
+        # 本批实际跳过集合：窗界证明的 authoritative 来源。
+        skipped_members: list[dict] = []
 
         # 批内按 event_ts 排序，“首条”即最早一条，判定与顺序无关。
         for hit in sorted(hits, key=_sort_key):
-            outcome = _ingest_one(conn, hit, batch_id, window_sec)
+            outcome, member = _ingest_one(conn, hit, batch_id, window_sec, proof_run_id)
             if outcome == "written":
                 report["written"] += 1
             elif outcome == "held":
                 report["held"] += 1
                 report["held_hit_ids"].append(hit.get("id"))
+                if member and member.get("decision") == "held":
+                    skipped_members.append(member)
             elif outcome == "skipped":
                 report["skipped"] += 1
             else:
                 raise RuntimeError(f"未知收流结论: {outcome}")
+
+        # 去重成功：同一事务内落不可变窗界证明 + 全量 skipped 快照。
+        # 任一跳过键时刻不可核证 / 落在窗界外 -> 抛出 -> 整批回滚。
+        window_proof = burst.record_window_proof(
+            conn,
+            proof_run_id,
+            batch_id,
+            window_sec,
+            skipped_members,
+            _now(),
+        )
+        report["window_start"] = (window_proof or {}).get("window_start")
+        report["window_end"] = (window_proof or {}).get("window_end")
+        report["skipped_keys"] = (window_proof or {}).get("skipped_keys", [])
 
         conn.execute(
             "INSERT OR REPLACE INTO ingest_batches(id, created_at, report_json) VALUES (?,?,?)",
@@ -67,22 +88,34 @@ def run_batch(payload: dict | None = None) -> dict:
         conn.close()
 
 
-def _ingest_one(conn, hit: dict, batch_id: str, window_sec: int) -> str:
-    """单点击点入口：返回 written / held / skipped。"""
+def _ingest_one(
+    conn, hit: dict, batch_id: str, window_sec: int, proof_run_id: str
+) -> tuple[str, dict | None]:
+    """单点击点入口：返回 (written / held / skipped, 跳过成员快照或 None)。"""
     vid = hit["visitor_id"]
 
     # 同 id 重放：保持基座幂等，不重复计数、不动末击点。
     if conn.execute("SELECT 1 FROM hits WHERE id=?", (hit["id"],)).fetchone():
-        return "skipped"
+        return "skipped", None
     # 已搁置击点的重放同样幂等跳过，避免搁置区刷屏。
     if burst.already_held(conn, hit.get("id")):
-        return "skipped"
+        return "skipped", None
 
     decision = burst.classify(conn, hit, window_sec)
     if decision["decision"] != "formal":
         # 失败闭：窗内重复 / 不可核证均入搁置，绝不入正式。
-        burst.hold(conn, hit, decision, batch_id, _now())
-        return "held"
+        burst.hold(conn, hit, decision, batch_id, _now(), proof_run_id=proof_run_id)
+        member = {
+            "hit_id": hit.get("id"),
+            "visitor_id": hit.get("visitor_id"),
+            "page_path": hit.get("page_path"),
+            "event_name": hit.get("event_name"),
+            "event_ts": hit.get("event_ts"),
+            "dedupe_of": decision.get("prior_id"),
+            "delta_sec": decision.get("delta_sec"),
+            "decision": decision.get("decision"),
+        }
+        return "held", member
 
     exists = conn.execute("SELECT 1 FROM visitors WHERE id=?", (vid,)).fetchone()
     if not exists:
@@ -128,7 +161,7 @@ def _ingest_one(conn, hit: dict, batch_id: str, window_sec: int) -> str:
         ),
     )
     if not conn.execute("SELECT changes()").fetchone()[0]:
-        return "skipped"
+        return "skipped", None
     conn.execute(
         """
         UPDATE sessions
@@ -164,7 +197,7 @@ def _ingest_one(conn, hit: dict, batch_id: str, window_sec: int) -> str:
             _now(),
         ),
     )
-    return "written"
+    return "written", None
 
 
 def _sort_key(hit: dict):

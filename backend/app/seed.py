@@ -49,6 +49,31 @@ CREATE TABLE IF NOT EXISTS ingest_batches (
   report_json TEXT NOT NULL DEFAULT '{}'
 );
 
+-- 去重批次不可变窗界 + skipped 全量快照。
+-- 每次去重提交（成功）在同一事务内落一行：窗界（覆盖本批全部 skipped 键）、
+-- 窗秒快照、skipped_keys 全量清单。窗界与清单落库后不可改写，
+-- 「改窗配置」只影响后续批次的 settings.burst_window_sec，不回溯旧证明。
+CREATE TABLE IF NOT EXISTS burst_dedupe_proofs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proof_run_id TEXT NOT NULL UNIQUE,
+  batch_id TEXT NOT NULL,
+  window_start TEXT,
+  window_end TEXT,
+  window_sec INTEGER NOT NULL,
+  skipped_keys_json TEXT NOT NULL DEFAULT '[]',
+  skipped_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_burst_dedupe_proofs_batch
+  ON burst_dedupe_proofs(batch_id);
+
+CREATE TRIGGER IF NOT EXISTS burst_dedupe_proofs_immutable
+BEFORE UPDATE ON burst_dedupe_proofs
+BEGIN
+  SELECT RAISE(ABORT, 'burst_dedupe_proofs 窗界证明不可改写');
+END;
+
 CREATE TABLE IF NOT EXISTS session_proofs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL,

@@ -18,6 +18,18 @@
 - 无任何同键正式成员（首条）或已越过窗：入正式，按既有切窗逻辑挂会话并
   更新末击点。窗内重复不产生新的正式成员，因此后续仍与首条比较。
 - ``reason='burst_window_unverifiable'``：无法核证时间戳时的失败闭搁置。
+
+窗界证明（落库形态：**窗界对照证明表** ``burst_dedupe_proofs``）：
+
+- 每个含跳过键的去重提交，在**同一事务**内落一行不可变证明：窗界取本批实际
+  跳过键时刻的最小/最大，``skipped_keys_json`` 为该批全量跳过清单，
+  ``window_sec`` 为入正式时的窗秒快照。
+- 「缺一回滚」：任一跳过键时刻不可核证、重复、或落在所定窗界外即抛错，
+  整批（含已写 hints / 搁置）回滚，绝不落覆盖不全或与跳过集合不符的证明。
+- 证明行由 ``burst_dedupe_proofs_immutable`` 触发器禁止 UPDATE；改窗配置
+  只影响后续批次，不回溯改写旧证明窗界。
+- ``window_proof`` 只读核证：窗界覆盖性、证明键集合 = 实际跳过集合、跳过键
+  未混入正式击点、结论。
 """
 
 from datetime import datetime, timezone
@@ -163,8 +175,19 @@ def already_held(conn, hit_id: str) -> bool:
     return row is not None
 
 
-def hold(conn, hit: dict, decision: dict, batch_id: str, created_at: str) -> int:
-    """把窗内重复（或不可核证）击点写入搁置区，返回 quarantine.id。"""
+def hold(
+    conn,
+    hit: dict,
+    decision: dict,
+    batch_id: str,
+    created_at: str,
+    proof_run_id: str | None = None,
+) -> int:
+    """把窗内重复（或不可核证）击点写入搁置区，返回 quarantine.id。
+
+    ``proof_run_id`` 关联本次去重提交的窗界证明；窗界证明与搁置写入处于
+    调用方同一个事务，缺一即回滚。
+    """
     import json
 
     member = {
@@ -174,6 +197,7 @@ def hold(conn, hit: dict, decision: dict, batch_id: str, created_at: str) -> int
         "page_path": hit.get("page_path"),
         "event_name": hit.get("event_name"),
         "batch_id": batch_id,
+        "proof_run_id": proof_run_id,
         "decision": decision.get("decision"),
         "dedupe_of": decision.get("prior_id"),
         "dedupe_of_ts": decision.get("prior_ts"),
@@ -212,18 +236,344 @@ def _anomaly(code: str, message: str, **extra) -> dict:
     return item
 
 
-def proof(conn, visitor_id: str | None = None, window_sec: int | None = None) -> dict:
-    return {
-        "visitor_id": visitor_id,
-        "window_start": "1970-01-01T00:00:00Z",
-        "window_end": "1970-01-01T00:00:01Z",
-        "window_sec": window_sec or burst_window_sec(conn),
-        "skipped_keys": [],
-        "aligned": True,
-    }
-    # 原窗界核证保留但不可达
+def _fmt(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def proof_unused(conn, visitor_id: str | None = None, window_sec: int | None = None) -> dict:
+
+def window_bounds(entries: list[dict]) -> tuple[str, str]:
+    """由本批实际跳过键的时刻求窗界（取最小/最大时刻，两端闭）。
+
+    任一跳过键时刻不可解析即抛 ``ValueError``：禁止在不可核证时仍宣告成功。
+    """
+    times = []
+    for entry in entries:
+        try:
+            times.append(parse_ts(entry.get("event_ts")))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"跳过键 {entry.get('hit_id')!r} 的时刻不可核证: {exc}"
+            ) from exc
+    if not times:
+        raise ValueError("无跳过键，无法定窗界")
+    return _fmt(min(times)), _fmt(max(times))
+
+
+def record_window_proof(
+    conn,
+    proof_run_id: str,
+    batch_id: str,
+    window_sec: int,
+    skipped: list[dict],
+    created_at: str,
+) -> dict | None:
+    """去重成功时，与跳过写入**同一事务**落窗界证明（调用方负责 commit）。
+
+    - 窗界覆盖本批全部跳过键；任一键时刻不可解析即抛出，令整批回滚
+      （「缺一回滚」，绝不落一份覆盖不全的证明）。
+    - 证明键集合 = 本批实际跳过集合（``skipped`` 即权威来源）。
+    - 窗界与 skipped 快照落库后不可改写（见 ``burst_dedupe_proofs_immutable``
+      触发器），改窗配置不回溯旧证明。
+    """
+    import json
+
+    if not skipped:
+        return None
+
+    entries = []
+    seen = set()
+    for raw in skipped:
+        hit_id = raw.get("hit_id")
+        if not hit_id:
+            raise ValueError("跳过键缺少 hit_id，拒绝落证明")
+        if hit_id in seen:
+            raise ValueError(f"跳过键 {hit_id!r} 重复，拒绝落重复证明")
+        seen.add(hit_id)
+        entries.append(
+            {
+                "hit_id": hit_id,
+                "visitor_id": raw.get("visitor_id"),
+                "page_path": raw.get("page_path"),
+                "event_name": raw.get("event_name"),
+                "event_ts": raw.get("event_ts"),
+                "dedupe_of": raw.get("dedupe_of"),
+                "delta_sec": raw.get("delta_sec"),
+            }
+        )
+    entries.sort(key=lambda e: (e["hit_id"],))
+
+    start, end = window_bounds(entries)
+    start_ts, end_ts = parse_ts(start), parse_ts(end)
+    if start_ts > end_ts:
+        raise ValueError("窗界倒置，拒绝落证明")
+    for entry in entries:
+        ts = parse_ts(entry["event_ts"])
+        if ts < start_ts or ts > end_ts:
+            raise ValueError(f"跳过键 {entry['hit_id']!r} 落在窗界外，拒绝落证明")
+
+    conn.execute(
+        """
+        INSERT INTO burst_dedupe_proofs(
+          proof_run_id, batch_id, window_start, window_end, window_sec,
+          skipped_keys_json, skipped_count, created_at
+        ) VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (
+            proof_run_id,
+            batch_id,
+            start,
+            end,
+            int(window_sec),
+            json.dumps(entries, ensure_ascii=False, sort_keys=True),
+            len(entries),
+            created_at,
+        ),
+    )
+    return {
+        "proof_run_id": proof_run_id,
+        "batch_id": batch_id,
+        "window_start": start,
+        "window_end": end,
+        "window_sec": int(window_sec),
+        "skipped_keys": [e["hit_id"] for e in entries],
+        "skipped_count": len(entries),
+    }
+
+
+def _load_skipped(raw: str) -> list[dict]:
+    import json
+
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [v for v in value if isinstance(v, dict)]
+
+
+def window_proof(
+    conn,
+    batch_id: str | None = None,
+    visitor_id: str | None = None,
+) -> dict:
+    """窗界核证（只读）：窗界 / skipped 集合 / 结论。
+
+    对每条已落库的去重证明逐项核对：
+
+    - 窗界可解析、不倒置，且**覆盖**该证明声明的全部 skipped 键；
+    - 证明键集合 = 该次去重实际跳过集合（按 ``proof_run_id`` 对搁置区回查）；
+    - 跳过键不得混入正式击点（会话成员）；
+    - 旧证明窗界与当前 ``settings.burst_window_sec`` 无关，改窗不回溯。
+
+    ``visitor_id`` 过滤时，每条证明仅核对该访客的键与覆盖性；证明的全量
+    键集合完整性（对搁置区回查）以不过滤的全量核证为准。
+
+    只读，不写库。
+    """
+    params: list = []
+    where = []
+    if batch_id:
+        where.append("batch_id=?")
+        params.append(batch_id)
+    sql = "SELECT * FROM burst_dedupe_proofs"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    rows = conn.execute(sql, params).fetchall()
+
+    anomalies: list[dict] = []
+    proofs: list[dict] = []
+    for row in rows:
+        entries = _load_skipped(row["skipped_keys_json"])
+        issues: list[dict] = []
+
+        stored_ids = [e.get("hit_id") for e in entries]
+        if visitor_id:
+            entries = [e for e in entries if e.get("visitor_id") == visitor_id]
+            stored_ids = [e.get("hit_id") for e in entries]
+            if not entries:
+                # 该访客在本批无跳过键：本证明不适用于此过滤。
+                continue
+
+        # 1. 窗界自洽：可解析、不倒置。
+        try:
+            start_ts = parse_ts(row["window_start"])
+            end_ts = parse_ts(row["window_end"])
+        except (TypeError, ValueError) as exc:
+            start_ts = end_ts = None
+            issues.append(
+                _anomaly(
+                    "window_bound_unparseable",
+                    "证明窗界不可解析",
+                    proof_run_id=row["proof_run_id"],
+                    error=str(exc),
+                )
+            )
+        if start_ts is not None and start_ts > end_ts:
+            issues.append(
+                _anomaly(
+                    "window_bound_inverted",
+                    "证明窗界倒置",
+                    proof_run_id=row["proof_run_id"],
+                    window_start=row["window_start"],
+                    window_end=row["window_end"],
+                )
+            )
+
+        # 2. 覆盖：每个跳过键的时刻必须落在窗界内（两端闭）。
+        if start_ts is not None:
+            for entry in entries:
+                try:
+                    ts = parse_ts(entry.get("event_ts"))
+                except (TypeError, ValueError) as exc:
+                    issues.append(
+                        _anomaly(
+                            "skipped_key_unverifiable",
+                            "跳过键时刻不可解析，无法核证其落在窗界内",
+                            proof_run_id=row["proof_run_id"],
+                            hit_id=entry.get("hit_id"),
+                            error=str(exc),
+                        )
+                    )
+                    continue
+                if ts < start_ts or ts > end_ts:
+                    issues.append(
+                        _anomaly(
+                            "skipped_key_outside_window",
+                            "跳过键落在证明窗界外",
+                            proof_run_id=row["proof_run_id"],
+                            hit_id=entry.get("hit_id"),
+                            event_ts=entry.get("event_ts"),
+                            window_start=row["window_start"],
+                            window_end=row["window_end"],
+                        )
+                    )
+
+        # 3. 全量：证明键集合 = 实际跳过集合。
+        #    无访客过滤时两者皆全量，直接对撞；过滤时仅核对「本访客实际跳过」
+        #    是否已被证明覆盖（全量完整性由无过滤核证负责）。
+        actual_rows = conn.execute(
+            """
+            SELECT id, member_json FROM quarantine
+            WHERE reason=? AND json_extract(member_json, '$.proof_run_id')=?
+            """,
+            (REASON_DUPLICATE, row["proof_run_id"]),
+        ).fetchall()
+        actual_ids = set()
+        for q in actual_rows:
+            member = _load_member(q["member_json"])
+            if visitor_id and member.get("visitor_id") != visitor_id:
+                continue
+            if member.get("hit_id"):
+                actual_ids.add(member["hit_id"])
+        stored_set = set(stored_ids)
+
+        for missing in sorted(actual_ids - stored_set):
+            issues.append(
+                _anomaly(
+                    "proof_missing_skipped_key",
+                    "实际跳过的键未出现在证明中",
+                    proof_run_id=row["proof_run_id"],
+                    hit_id=missing,
+                )
+            )
+        if not visitor_id:
+            for extra in sorted(stored_set - actual_ids):
+                issues.append(
+                    _anomaly(
+                        "proof_extra_skipped_key",
+                        "证明声称跳过的键在搁置区不可核",
+                        proof_run_id=row["proof_run_id"],
+                        hit_id=extra,
+                    )
+                )
+
+        # 4. 会话成员：跳过键不得混入正式击点。
+        for hit_id in sorted(stored_set):
+            admitted = conn.execute(
+                "SELECT session_id FROM hits WHERE id=?", (hit_id,)
+            ).fetchone()
+            if admitted:
+                issues.append(
+                    _anomaly(
+                        "skipped_key_admitted",
+                        "证明中的跳过键却作为正式击点存在",
+                        proof_run_id=row["proof_run_id"],
+                        hit_id=hit_id,
+                        session_id=admitted["session_id"],
+                    )
+                )
+
+        if row["skipped_count"] != len(_load_skipped(row["skipped_keys_json"])):
+            issues.append(
+                _anomaly(
+                    "skipped_count_mismatch",
+                    "证明 skipped_count 与键清单长度不一致",
+                    proof_run_id=row["proof_run_id"],
+                    skipped_count=row["skipped_count"],
+                )
+            )
+
+        anomalies.extend(issues)
+        proofs.append(
+            {
+                "proof_run_id": row["proof_run_id"],
+                "batch_id": row["batch_id"],
+                "window_start": row["window_start"],
+                "window_end": row["window_end"],
+                "window_sec": row["window_sec"],
+                "skipped_keys": sorted(stored_set),
+                "skipped_count": len(stored_set),
+                "skipped": entries,
+                "created_at": row["created_at"],
+                "ok": not issues,
+                "anomalies": issues,
+            }
+        )
+
+    # 有实际跳过却无证明行：说明去重成功但证明缺失。
+    if not batch_id:
+        orphan_sql = """
+            SELECT DISTINCT json_extract(member_json, '$.proof_run_id') AS run_id,
+                            json_extract(member_json, '$.batch_id') AS batch_id
+            FROM quarantine
+            WHERE reason=? AND json_extract(member_json, '$.proof_run_id') IS NOT NULL
+        """
+        if visitor_id:
+            orphan_sql += " AND visitor_id=?"
+        orphan_rows = conn.execute(
+            orphan_sql, (REASON_DUPLICATE, *([visitor_id] if visitor_id else []))
+        ).fetchall()
+        proven = {p["proof_run_id"] for p in proofs}
+        for orphan in orphan_rows:
+            run_id = orphan["run_id"]
+            if run_id and run_id not in proven:
+                issue = _anomaly(
+                    "window_proof_missing",
+                    "存在实际跳过却无窗界证明",
+                    proof_run_id=run_id,
+                    batch_id=orphan["batch_id"],
+                )
+                anomalies.append(issue)
+
+    return {
+        "read_only": True,
+        "current_window_sec": burst_window_sec(conn),
+        "window_config_form": WINDOW_CONFIG_FORM,
+        "approach": APPROACH,
+        "visitor_filtered": bool(visitor_id),
+        "ok": not anomalies,
+        "summary": {
+            "proofs": len(proofs),
+            "skipped_keys": sum(len(p["skipped_keys"]) for p in proofs),
+            "anomalies": len(anomalies),
+        },
+        "proofs": proofs,
+        "anomalies": anomalies,
+    }
+
+
+def proof(conn, visitor_id: str | None = None, window_sec: int | None = None) -> dict:
     """突发去重核证：只读，不写库。
 
     协同四件事：收流正式集、搁置重复集、会话末击点时钟、hit_count 核证。

@@ -3,13 +3,19 @@ import { computed, onMounted, ref } from 'vue'
 import { api } from '../api.js'
 
 const proof = ref(null)
+const windowProof = ref(null)
 const err = ref('')
 const visitor = ref('')
+const batch = ref('')
 
 async function load() {
   err.value = ''
   try {
     proof.value = await api.burstProof(visitor.value.trim() || undefined)
+    windowProof.value = await api.burstWindowProof(
+      batch.value.trim() || undefined,
+      visitor.value.trim() || undefined,
+    )
   } catch (e) {
     err.value = String(e.message || e)
   }
@@ -38,6 +44,12 @@ onMounted(load)
       <input
         v-model="visitor"
         placeholder="访客 ID（可空）"
+        class="mono"
+        @keyup.enter="load"
+      />
+      <input
+        v-model="batch"
+        placeholder="批次 ID（窗界核证，可空）"
         class="mono"
         @keyup.enter="load"
       />
@@ -107,6 +119,34 @@ onMounted(load)
           </tr>
         </tbody>
       </table>
+
+      <template v-if="windowProof">
+        <h2>窗界证明 <span :class="windowProof.ok ? 'ok' : 'err'">{{ windowProof.ok ? '通过' : '异常' }}</span></h2>
+        <p class="muted">
+          只读。每条去重证明的窗界须覆盖其全部 skipped 键，证明键集合须等于实际跳过集合；
+          改窗配置不回溯改写旧证明窗界（当前窗 {{ windowProof.current_window_sec }}s）。
+        </p>
+        <p v-if="!windowProof.proofs.length" class="muted">暂无去重证明。</p>
+        <table v-else class="data">
+          <thead>
+            <tr>
+              <th>批次</th><th>窗界</th><th>窗秒快照</th>
+              <th>skipped 键</th><th>结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in windowProof.proofs" :key="p.proof_run_id">
+              <td class="mono">{{ p.batch_id }}</td>
+              <td class="mono">{{ p.window_start }} → {{ p.window_end }}</td>
+              <td>{{ p.window_sec }}s</td>
+              <td class="mono">
+                <span v-for="k in p.skipped_keys" :key="k" class="chip held">{{ k }}</span>
+              </td>
+              <td :class="p.ok ? 'ok' : 'err'">{{ p.ok ? '一致' : '异常' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </template>
 
       <template v-if="proof.anomalies.length">
         <h2>异常明细</h2>

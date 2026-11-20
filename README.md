@@ -46,6 +46,13 @@ npm run dev
   即窗内重复。首条仍入正式并更新末击点；越窗后入正式并更新末击点。
 - **窗内重复**：写 `quarantine(reason='burst_window_dup')`，**不写 hits、不改
   `hit_count`、不改 `ended_at`（末击点时钟）**。重放已搁置击点幂等跳过。
+- **窗界证明（落库形态：证明表）**：`burst_dedupe_proofs` 表按每次去重提交落
+  一行不可变证明——窗界 `window_start/window_end`（取本批实际跳过键的最小/最大
+  时刻）、`window_sec` 快照、`skipped_keys_json` 全量清单。窗界与 skipped 快照
+  与搁置写入**同一 `BEGIN IMMEDIATE` 事务**：跳过键时刻不可核证、落在窗界外或
+  重复时抛错，整批回滚（「缺一回滚」），绝不落覆盖不全的证明。该表由
+  `burst_dedupe_proofs_immutable` 触发器禁止 UPDATE，改窗配置只影响后续批次，
+  不回溯改写旧证明窗界。
 
 接口：
 
@@ -54,16 +61,21 @@ npm run dev
 | PUT | `/api/settings/burst-window` | 写入 `burst_window_sec`（1..86400） |
 | GET | `/api/burst-dedupe/config` | 只读读取窗配置与所选形态 |
 | GET | `/api/burst-dedupe/proof` | **只读**核证：正式集 / 搁置重复集 / 末击点时钟 / `hit_count` 互证 |
+| GET | `/api/burst-dedupe/window-proof` | **只读**窗界核证：窗界 / skipped 集合 / 结论（可传 `?batch_id=`、`?visitor_id=`） |
 
 核证只读，不写库；可传 `?visitor_id=` 过滤。任何同键正式成员落在窗内、搁置记录引用的
 正式成员缺失或异键、`ended_at` 与正式最大 `event_ts` 不一致、`hit_count` 与正式点数
 不一致，均报为异常。
 
+窗界核证逐条核对：证明窗界可解析且不倒置、**覆盖全部 skipped 键**；
+**证明键集合 = 实际跳过集合**（按 `proof_run_id` 回查搁置区，缺键或多余均报）；
+跳过键不得混入正式击点；当前窗已变时旧证明窗界仍为其落库快照。
+
 本地夹具验收（SQLite）：
 
 ```bash
 cd backend
-pytest tests -q          # 13 项，含窗内连点只留首条、搁置可见其余
+pytest tests -q          # 20 项，含窗内连点只留首条、搁置可见其余、窗界覆盖全量跳过键
 python -m uvicorn app.main:app --port 10900   # 前端「收流」→「核证」「搁置」
 ```
 
